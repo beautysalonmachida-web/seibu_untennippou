@@ -1,19 +1,19 @@
 // ===========================================
-// かんたん運転日報システム V3.11
+// かんたん運転日報システム V4.0
 // Google Apps Script バックエンドコード
 // ===========================================
 
-const DB_SS_ID = '1m-gg-S_WESgZffPBxabUyVLZrr1EqGgZRmVysiDhHF8';
+const DB_SS_ID = '1V7re633xJUZfVnG1Ym7rvy6nHm1u5nP2HVsN6fL7XOw';
 const MASTER_SS_ID = '1Ic4bJeFm8VgQx7WTogNrTiwEUvskw1v0NOTQnD70GGw';
 
 const SHEET_NAMES = {
-  LOG_DATA: '記録蓄積用',
-  ADMIN_SETTINGS: '管理者設定' 
+  LOG_DATA: '運転記録',
+  ADMIN_SETTINGS: '管理者設定',
+  CAR_LIST: '社用車一覧'
 };
 
 const EXT_SHEET_NAMES = {
-  EMPLOYEE: '社員マスタ',
-  CARS: ['車両管理_本社', '車両管理_大阪', '車両管理_姫路']
+  EMPLOYEE: '社員マスタ'
 };
 
 const STATUS = {
@@ -26,7 +26,7 @@ const STATUS = {
 
 function doGet() {
   return HtmlService.createHtmlOutputFromFile('index')
-    .setTitle('かんたん運転日報 V3.11')
+    .setTitle('かんたん運転日報 V4.0')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
     .addMetaTag('viewport', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no');
 }
@@ -79,39 +79,27 @@ function fetchAllEmployees() {
   for (let i = 1; i < data.length; i++) {
     const name = String(data[i][0]).trim();
     const id = String(data[i][1]).trim();
-    if (name && id) employees[name] = { name: name, userId: id, email: data[i][2] };
+    const email = data[i][2] || '';
+    const carNumber = String(data[i][3] || '').trim(); // D列: 担当車番
+    const base = String(data[i][4] || '').trim();       // E列: 拠点
+    if (name && id) employees[name] = { name, userId: id, email, carNumber, base };
   }
   return employees;
 }
 
 function fetchAllCars() {
-  let allCars = [];
-  EXT_SHEET_NAMES.CARS.forEach(sheetName => {
-    const sheet = getMasterSheet(sheetName);
-    if (sheet) {
-      const data = sheet.getDataRange().getValues();
-      for (let i = 1; i < data.length; i++) {
-        // A列(0)はボタンのため、データはB列(1)から開始と仮定して取得
-        // B列(1): 車両ID
-        // C列(2): 所有者（拠点）
-        // D列(3): 社員番号
-        // ...
-        // H列(7): 登録番号
-
-        let number = '';
-        if (data[i][7]) number = String(data[i][7]).trim(); // H列
-        
-        if (number) {
-          allCars.push({
-            owner: String(data[i][2]), // C列: 所有者（拠点）
-            userId: String(data[i][3]), // D列: 社員番号
-            number: number, 
-          });
-        }
-      }
+  const sheet = getDbSheet(SHEET_NAMES.CAR_LIST);
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  const cars = [];
+  for (let i = 1; i < data.length; i++) {
+    const carNumber = String(data[i][0]).trim(); // A列: 車番
+    const carType = String(data[i][1] || '').trim(); // B列: 車種
+    if (carNumber) {
+      cars.push({ carNumber, carType });
     }
-  });
-  return allCars;
+  }
+  return cars;
 }
 
 function fetchAdminSettings() {
@@ -133,20 +121,18 @@ function login(userName) {
     const employees = fetchAllEmployees();
     const user = employees[userName];
     if (!user) return { success: false, message: '社員マスタ未登録' };
-    
+
     const admins = fetchAdminSettings();
     const adminInfo = admins[user.userId];
     const role = adminInfo ? '管理者' : '使用者';
-    const adminBase = adminInfo ? adminInfo.base : ''; 
-    
-    const cars = fetchAllCars();
-    const assigned = cars.find(c => c.userId === user.userId);
-    
+    const adminBase = adminInfo ? adminInfo.base : '';
+
     return {
       success: true,
       user: {
         userId: user.userId, name: user.name,
-        carNumber: assigned ? assigned.number : '',
+        carNumber: user.carNumber || '',
+        base: user.base || '',
         role: role, adminBase: adminBase
       }
     };
@@ -165,39 +151,45 @@ function getUserList() {
 function getCarList() {
   try {
     const cars = fetchAllCars();
-    return { success: true, cars: cars.map(c => ({ carNumber: c.number, carType: '' })) };
+    return { success: true, cars: cars };
   } catch (e) { return { success: false, message: e.message }; }
 }
 
-// --- 履歴取得（車両ごとにグループ化 + 追加車両対応） ---
+// --- 履歴取得（車両ごとにグループ化 + 車両切替対応） ---
 function getHistory(userId, yearMonth, extraCarNumbers = []) {
   try {
     const sheet = getDbSheet(SHEET_NAMES.LOG_DATA);
-    if (!sheet) return { success: true, carHistories: [] };
+    if (!sheet) return { success: true, carHistories: [], monthTotal: { distance: 0, workDays: 0 } };
 
     const data = sheet.getDataRange().getValues();
     const period = getMonthPeriod(yearMonth);
     const startDate = new Date(period.start); startDate.setHours(0,0,0,0);
     const endDate = new Date(period.end); endDate.setHours(23,59,59,999);
-    
-    const holidays = {};
-    try{
-      const cal = CalendarApp.getCalendarById('ja.japanese#holiday@group.v.calendar.google.com');
-      cal.getEvents(startDate, endDate).forEach(ev => holidays[Utilities.formatDate(ev.getStartTime(),Session.getScriptTimeZone(),'yyyy-MM-dd')]=true);
-    }catch(err){}
 
-    const allMasterCars = fetchAllCars();
-    const myAssignedCar = allMasterCars.find(c => c.userId === String(userId));
-    
+    const holidays = {};
+    try {
+      const cal = CalendarApp.getCalendarById('ja.japanese#holiday@group.v.calendar.google.com');
+      cal.getEvents(startDate, endDate).forEach(ev => holidays[Utilities.formatDate(ev.getStartTime(), Session.getScriptTimeZone(), 'yyyy-MM-dd')] = true);
+    } catch (err) {}
+
+    // 社員マスタから担当車番を取得
+    const allEmployees = fetchAllEmployees();
+    let myAssignedCarNum = '';
+    Object.values(allEmployees).forEach(emp => {
+      if (emp.userId === String(userId) && emp.carNumber) myAssignedCarNum = emp.carNumber;
+    });
+
     const usedCarNumbers = new Set();
-    if (myAssignedCar) usedCarNumbers.add(myAssignedCar.number);
+    if (myAssignedCarNum) usedCarNumbers.add(myAssignedCarNum);
     if (extraCarNumbers && Array.isArray(extraCarNumbers)) {
       extraCarNumbers.forEach(c => usedCarNumbers.add(c));
     }
 
     const carRecordsMap = {};
+    // 車両ごとの使用日範囲を追跡
+    const carDateRange = {};
     let monthStatus = STATUS.WORKING;
-    let hasSub=false, hasApp=false, hasRej=false;
+    let hasSub = false, hasApp = false, hasRej = false;
 
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
@@ -208,16 +200,19 @@ function getHistory(userId, yearMonth, extraCarNumbers = []) {
 
       if (rowDate >= startDate && rowDate <= endDate) {
         const dateStr = Utilities.formatDate(rowDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-        const carNum = String(row[4] || '未設定'); 
-        
+        const carNum = String(row[4] || '未設定');
+
         usedCarNumbers.add(carNum);
-        
+
         if (!carRecordsMap[carNum]) carRecordsMap[carNum] = {};
-        
+        if (!carDateRange[carNum]) carDateRange[carNum] = { first: dateStr, last: dateStr };
+        if (dateStr < carDateRange[carNum].first) carDateRange[carNum].first = dateStr;
+        if (dateStr > carDateRange[carNum].last) carDateRange[carNum].last = dateStr;
+
         const st = String(row[18] || '作業中');
-        if (st === STATUS.APPROVED) hasApp=true;
-        if (st === STATUS.SUBMITTED) hasSub=true;
-        if (st === STATUS.REJECTED) hasRej=true;
+        if (st === STATUS.APPROVED) hasApp = true;
+        if (st === STATUS.SUBMITTED) hasSub = true;
+        if (st === STATUS.REJECTED) hasRej = true;
 
         carRecordsMap[carNum][dateStr] = {
           id: String(row[0]),
@@ -247,40 +242,71 @@ function getHistory(userId, yearMonth, extraCarNumbers = []) {
     else if (hasRej) monthStatus = STATUS.REJECTED;
 
     const carHistories = [];
-    
+    let monthTotalDist = 0;
+    let monthTotalDays = 0;
+
     usedCarNumbers.forEach(carNum => {
-        const dailyList = [];
-        const currentDate = new Date(startDate);
-        
-        while (currentDate <= endDate) {
-            const dateStr = Utilities.formatDate(currentDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-            const dayOfWeek = currentDate.getDay();
-            const isHoliday = !!holidays[dateStr];
-            
-            const record = (carRecordsMap[carNum] && carRecordsMap[carNum][dateStr]) ? carRecordsMap[carNum][dateStr] : null;
-            
-            if (record) {
-                dailyList.push({ ...record, dayOfWeek: dayOfWeek, isHoliday: isHoliday });
-            } else {
-                dailyList.push({
-                    id: '', date: dateStr, carNumber: carNum,
-                    departureMeter: '', 
-                    arrivalMeter: '', distance: '', destination: '',
-                    alcoholStart: '', alcoholEnd: '', dailyCheck: '', carCleaning: '', troubleStatus: '',
-                    refuel: '', remarks: '', status: '', rejectComment: '', isSaved: false,
-                    dayOfWeek: dayOfWeek, isHoliday: isHoliday
-                });
-            }
-            currentDate.setDate(currentDate.getDate() + 1);
+      const dailyList = [];
+      let carDist = 0;
+      let carDays = 0;
+      const currentDate = new Date(startDate);
+
+      // 担当車番 or 手動追加車両 → 全日付表示
+      // レコードから検出された車両 → 使用期間のみ表示
+      const isAssignedOrExtra = (carNum === myAssignedCarNum) ||
+        (extraCarNumbers && extraCarNumbers.includes(carNum));
+      const range = carDateRange[carNum];
+
+      while (currentDate <= endDate) {
+        const dateStr = Utilities.formatDate(currentDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+        const dayOfWeek = currentDate.getDay();
+        const isHoliday = !!holidays[dateStr];
+
+        const record = (carRecordsMap[carNum] && carRecordsMap[carNum][dateStr]) ? carRecordsMap[carNum][dateStr] : null;
+
+        // この日付を表示するかどうか判定
+        let showDate = false;
+        if (isAssignedOrExtra) {
+          showDate = true; // 担当車・追加車両は全日表示
+        } else if (range) {
+          showDate = (dateStr >= range.first && dateStr <= range.last); // レコード範囲内のみ
         }
-        
+
+        if (showDate) {
+          if (record) {
+            dailyList.push({ ...record, dayOfWeek, isHoliday });
+            const d = parseFloat(record.distance);
+            if (!isNaN(d) && d > 0) { carDist += d; carDays++; }
+          } else {
+            dailyList.push({
+              id: '', date: dateStr, carNumber: carNum,
+              departureMeter: '', arrivalMeter: '', distance: '', destination: '',
+              alcoholStart: '', alcoholEnd: '', dailyCheck: '', carCleaning: '', troubleStatus: '',
+              refuel: '', remarks: '', status: '', rejectComment: '', isSaved: false,
+              dayOfWeek, isHoliday
+            });
+          }
+        }
+        currentDate.setDate(currentDate.getDate() + 1);
+      }
+
+      if (dailyList.length > 0) {
         carHistories.push({
-            carNumber: carNum,
-            records: dailyList
+          carNumber: carNum,
+          records: dailyList,
+          subtotal: { distance: Math.round(carDist * 10) / 10, workDays: carDays }
         });
+        monthTotalDist += carDist;
+        monthTotalDays += carDays;
+      }
     });
-    
-    return { success: true, carHistories: carHistories, monthStatus: monthStatus };
+
+    return {
+      success: true,
+      carHistories: carHistories,
+      monthStatus: monthStatus,
+      monthTotal: { distance: Math.round(monthTotalDist * 10) / 10, workDays: monthTotalDays }
+    };
   } catch (e) {
     return { success: false, message: '履歴取得エラー: ' + e.message };
   }
@@ -499,14 +525,12 @@ function getAdminPendingList(adminUserId) {
     const adminInfo = admins[adminUserId];
     if (!adminInfo) return { success: false, message: '管理者権限なし' };
     const targetBase = adminInfo.base;
-    
-    const cars = fetchAllCars();
-    const carBaseMap = {};
+
+    // 社員マスタから拠点マッピング取得
+    const allEmployees = fetchAllEmployees();
     const userBaseMap = {};
-    
-    cars.forEach(c => {
-      if(c.number) carBaseMap[c.number] = c.owner;
-      if(c.userId) userBaseMap[c.userId] = c.owner;
+    Object.values(allEmployees).forEach(emp => {
+      userBaseMap[emp.userId] = emp.base || '不明';
     });
 
     const sheet = getDbSheet(SHEET_NAMES.LOG_DATA);
@@ -517,17 +541,9 @@ function getAdminPendingList(adminUserId) {
       const row = data[i];
       const status = String(row[18]);
       if (status === STATUS.SUBMITTED || status === STATUS.APPROVED) {
-        const carNum = String(row[4]);
         const userId = String(row[2]);
-        
-        // 拠点判定
-        let recordBase = carBaseMap[carNum];
-        if(!recordBase && userBaseMap[userId]) {
-          recordBase = userBaseMap[userId];
-        }
-        if(!recordBase) recordBase = '不明';
-        
-        // 拠点が「不明」のデータは弾かずに表示する（管理者が確認できるように）
+        const recordBase = userBaseMap[userId] || '不明';
+
         if (targetBase && recordBase !== '不明' && targetBase !== recordBase) continue;
 
         let ym = row[17];
@@ -535,10 +551,10 @@ function getAdminPendingList(adminUserId) {
         const key = userId + '_' + ym;
 
         if (!grouped[key]) {
-          grouped[key] = { userId:userId, userName:userName, yearMonth:ym, status:status, totalDistance:0, workDays:0, base:recordBase };
+          grouped[key] = { userId, userName, yearMonth: ym, status, totalDistance: 0, workDays: 0, base: recordBase };
         }
         if (status === STATUS.APPROVED) grouped[key].status = STATUS.APPROVED;
-        
+
         const dist = parseFloat(row[7]);
         if (!isNaN(dist) && dist > 0) {
           grouped[key].totalDistance += dist;
@@ -547,8 +563,8 @@ function getAdminPendingList(adminUserId) {
       }
     }
     let list = Object.values(grouped);
-    list.sort((a,b)=>(a.status===STATUS.SUBMITTED && b.status!==STATUS.SUBMITTED)?-1:1);
-    return { success: true, list: list };
+    list.sort((a, b) => (a.status === STATUS.SUBMITTED && b.status !== STATUS.SUBMITTED) ? -1 : 1);
+    return { success: true, list };
   } catch (e) { return { success: false, message: e.message }; }
 }
 
@@ -558,27 +574,18 @@ function getSubmissionMatrix(adminUserId) {
     const admins = fetchAdminSettings();
     const adminInfo = admins[adminUserId];
     if (!adminInfo) return { success: false, message: '管理者権限なし' };
-    const targetBase = adminInfo.base; 
+    const targetBase = adminInfo.base;
 
     const allEmployees = fetchAllEmployees();
-    const allCars = fetchAllCars();
-    
-    // 社員ID -> 担当車両の所有拠点（＝所属拠点とみなす）のマッピング作成
-    const userBaseMap = {};
-    allCars.forEach(c => {
-      if(c.userId) userBaseMap[c.userId] = c.owner;
-    });
 
     const employees = [];
     Object.values(allEmployees).forEach(emp => {
-      const base = userBaseMap[emp.userId] || '不明';
-      // ここでも「不明」は通す
-      if(targetBase && base !== targetBase && base !== '不明') return; 
-      
-      employees.push({ userId: emp.userId, name: emp.name, base: base });
+      const base = emp.base || '不明';
+      if (targetBase && base !== targetBase && base !== '不明') return;
+      employees.push({ userId: emp.userId, name: emp.name, base });
     });
-    
-    employees.sort((a,b) => a.userId.localeCompare(b.userId));
+
+    employees.sort((a, b) => a.userId.localeCompare(b.userId));
 
     // 表示年月リスト作成（直近6ヶ月）
     const months = [];
