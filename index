@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>かんたん運転日報 V3.7</title>
+    <title>かんたん運転日報 V4.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -71,7 +71,7 @@
             <div class="max-w-2xl mx-auto p-4">
                 <div class="text-center py-12">
                     <h1 class="text-3xl font-extrabold text-gray-800 mb-2">かんたん運転日報</h1>
-                    <p class="text-gray-500">Ver 3.7</p>
+                    <p class="text-gray-500">Ver 4.0</p>
                 </div>
                 <div class="card shadow-lg">
                     <label class="label mb-4 text-xl">お名前を選択してください</label>
@@ -160,6 +160,11 @@
                 <i class="fas fa-info-circle mr-1"></i>修正すると文字が赤くなります。「一括保存」で確定してください。
             </p>
             
+            <div id="history-month-summary" class="hidden card bg-blue-50 border border-blue-200 mb-4 text-center">
+                <p class="text-sm font-bold text-blue-600 mb-1">月間合計</p>
+                <p class="text-3xl font-extrabold text-blue-800"><span id="hist-month-total-dist">0</span> <span class="text-lg">km</span></p>
+                <p class="text-sm text-blue-500"><span id="hist-month-total-days">0</span>日稼働</p>
+            </div>
             <div id="history-tables-container" class="space-y-8">
                 <!-- JSで車両ごとのテーブルを生成 -->
             </div>
@@ -323,6 +328,23 @@
         let rejectTarget = null;
         let extraCars = []; 
 
+        function escapeHtml(str) {
+            const d = document.createElement('div');
+            d.textContent = str;
+            return d.innerHTML;
+        }
+        function toggleBtn(btn) { btn.classList.toggle('active'); }
+        function toggleTrouble(btn) {
+            const detail = document.getElementById('trouble-detail');
+            if (btn.textContent === 'なし') {
+                btn.textContent = 'あり'; btn.classList.add('active', 'trouble');
+                detail.style.display = 'block';
+            } else {
+                btn.textContent = 'なし'; btn.classList.remove('active', 'trouble');
+                detail.style.display = 'none'; detail.value = '';
+            }
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
             google.script.run.withSuccessHandler(showLogin).getUserList();
         });
@@ -443,14 +465,26 @@
                     
                     const weekDays = ['日','月','火','水','木','金','土'];
                     
+                    // 月間合計サマリー表示
+                    const mt = res.monthTotal || { distance: 0, workDays: 0 };
+                    const summaryEl = document.getElementById('history-month-summary');
+                    if (res.carHistories.length > 1 || mt.distance > 0) {
+                        document.getElementById('hist-month-total-dist').textContent = mt.distance.toLocaleString();
+                        document.getElementById('hist-month-total-days').textContent = mt.workDays;
+                        summaryEl.classList.remove('hidden');
+                    } else {
+                        summaryEl.classList.add('hidden');
+                    }
+
                     if (res.carHistories.length === 0) {
                         container.innerHTML = '<p class="text-center text-gray-500">履歴データがありません</p>';
                     }
 
                     res.carHistories.forEach((hist, carIdx) => {
+                        const sub = hist.subtotal || { distance: 0, workDays: 0 };
                         const wrapper = document.createElement('div');
                         wrapper.className = 'mb-8';
-                        wrapper.innerHTML = `<h3 class="font-bold text-lg mb-2 pl-2 border-l-4 border-blue-500">${hist.carNumber} の記録</h3>`;
+                        wrapper.innerHTML = `<h3 class="font-bold text-lg mb-2 pl-2 border-l-4 border-blue-500">${escapeHtml(hist.carNumber)} <span class="text-sm text-gray-500 ml-2">${sub.distance} km / ${sub.workDays}日</span></h3>`;
                         
                         const exWrapper = document.createElement('div');
                         exWrapper.className = 'excel-wrapper shadow-md';
@@ -525,6 +559,19 @@
                             tbody.appendChild(tr);
                         });
                         
+                        // 小計行を追加
+                        if (sub.distance > 0 || sub.workDays > 0) {
+                            const tfootRow = document.createElement('tr');
+                            tfootRow.style.background = '#f0f9ff';
+                            tfootRow.innerHTML = `
+                                <td colspan="3" class="cell-date font-bold text-blue-700" style="text-align:right;">小計</td>
+                                <td class="cell-date text-sm text-gray-500">${sub.workDays}日稼働</td>
+                                <td colspan="2" class="text-right pr-4 font-extrabold text-blue-700 text-lg">${sub.distance} km</td>
+                                <td colspan="7"></td>
+                            `;
+                            tbody.appendChild(tfootRow);
+                        }
+
                         exWrapper.appendChild(table);
                         wrapper.appendChild(exWrapper);
                         container.appendChild(wrapper);
@@ -796,8 +843,8 @@
                         div.className = 'card border-l-4 border-yellow-400';
                         div.innerHTML = `
                             <div class="flex justify-between items-start mb-2">
-                                <div><h3 class="font-extrabold text-xl">${item.userName}</h3><p class="text-gray-500 text-sm">${item.yearMonth} (${item.base})</p></div>
-                                <span class="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-xs font-bold">${item.status}</span>
+                                <div><h3 class="font-extrabold text-xl">${escapeHtml(item.userName)}</h3><p class="text-gray-500 text-sm">${escapeHtml(item.yearMonth)} (${escapeHtml(item.base)})</p></div>
+                                <span class="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-xs font-bold">${escapeHtml(item.status)}</span>
                             </div>
                             <div class="grid grid-cols-2 gap-4 mb-4 bg-gray-50 p-3 rounded">
                                 <div class="text-center"><span class="block text-xs text-gray-500">稼働日数</span><span class="font-bold text-lg">${item.workDays}日</span></div>
